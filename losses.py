@@ -15,13 +15,11 @@ class AdversarialLoss(nn.Module):
         return real_loss + fake_loss
 
     def generator_loss(self, d_fake):
-        # generator wants D(X, G(X)) -> 1, i.e. maximize log(D(X, G(X)))
         eps = 1e-8
         return -torch.log(d_fake.clamp(min=eps)).mean()
 
 
 class MSELoss(nn.Module):
-    
     def forward(self, gen, gt):
         return F.mse_loss(gen, gt)
 
@@ -38,10 +36,11 @@ class MaskLoss(nn.Module):
         super().__init__()
         self.register_buffer('channel_weight', torch.tensor([0.0, 1.0, 1.0]).view(1, 3, 1, 1))
 
-    def forward(self, gen, gt):
-        diff2 = (gen - gt) ** 2
-        weighted = diff2 * self.channel_weight.to(gen.device)
-        return weighted.mean()
+    def forward(self, pred, target):
+        mask = torch.tensor([0, 1, 1], device=pred.device).view(1, 3, 1, 1)
+        weighted_pred = pred * mask
+        weighted_target = target * mask
+        return F.mse_loss(weighted_pred, weighted_target)
 
 
 class SimilarityLoss(nn.Module):
