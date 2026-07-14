@@ -7,11 +7,7 @@ import torch.nn.functional as F
 
 
 class AdversarialLoss(nn.Module):
-    """
-    Eq. (14):
-        L_adv(G, D) = E[log D(X, Y) + log(1 - D(X, G(X)))]
-    """
-
+    
     def forward(self, d_real, d_fake):
         eps = 1e-8
         real_loss = -torch.log(d_real.clamp(min=eps)).mean()
@@ -25,11 +21,7 @@ class AdversarialLoss(nn.Module):
 
 
 class MSELoss(nn.Module):
-    """
-    Eq. (15): L_MSE = E[(Y - G(X))^2], the L2 distance between the
-    ground-truth mask and the generated mask.
-    """
-
+    
     def forward(self, gen, gt):
         return F.mse_loss(gen, gt)
 
@@ -53,33 +45,22 @@ class MaskLoss(nn.Module):
 
 
 class SimilarityLoss(nn.Module):
-    """
-    Eq. (17):
-        L_simi = -sum_{i,j} [ S log(P) + (1 - S) log(1 - P) ]
-    the (mean) binary cross-entropy between the predicted binary copy-move
-    mask P and the ground-truth binary mask S.
-    """
-
+    
     def forward(self, pred_binary, gt_binary):
         pred_binary = pred_binary.clamp(1e-6, 1 - 1e-6)
         return F.binary_cross_entropy(pred_binary, gt_binary)
 
 
 class CNNTGANLoss(nn.Module):
-    """
-    Eq. (13):
-        L_total(G, D) = L_adv(G, D) + l1 * L_MSE + l2 * L_mask + l3 * L_simi
-    with l1 = 100, l2 = 50, l3 = 20 (values used in the paper's experiments).
-    """
-
+    
     def __init__(self, lambda1=100.0, lambda2=50.0, lambda3=20.0):
         super().__init__()
         self.lambda1 = lambda1
         self.lambda2 = lambda2
         self.lambda3 = lambda3
 
-        self.adv = AdversarialLoss()
-        self.mse = MSELoss()
+        self.adv  = AdversarialLoss()
+        self.mse  = MSELoss()
         self.mask = MaskLoss()
         self.simi = SimilarityLoss()
 
@@ -87,8 +68,8 @@ class CNNTGANLoss(nn.Module):
         return self.adv(d_real, d_fake)
 
     def generator_loss(self, d_fake, gen_rgb, gt_rgb, gen_binary, gt_binary):
-        l_adv = self.adv.generator_loss(d_fake)
-        l_mse = self.mse(gen_rgb, gt_rgb)
+        l_adv  = self.adv.generator_loss(d_fake)
+        l_mse  = self.mse(gen_rgb, gt_rgb)
         l_mask = self.mask(gen_rgb, gt_rgb)
         l_simi = self.simi(gen_binary, gt_binary)
 
@@ -98,10 +79,10 @@ class CNNTGANLoss(nn.Module):
                  + self.lambda3 * l_simi)
 
         logs = {
-            'adv': l_adv.item(),
-            'mse': l_mse.item(),
-            'mask': l_mask.item(),
-            'simi': l_simi.item(),
+            'adv'  : l_adv.item(),
+            'mse'  : l_mse.item(),
+            'mask' : l_mask.item(),
+            'simi' : l_simi.item(),
             'total': total.item(),
         }
         return total, logs
