@@ -17,9 +17,6 @@ documented choices — see "Assumptions" below.
 ```
 cnn_t_gan/
 ├── __init__.py
-├── layers.py         # Bottleneck/ConvStage (CNN branch), MHSA/MLP/TransformerStage
-│                      # (transformer branch), FeatureCouplingDown/Up (Fig. 6),
-│                      # PearsonCorrelationLayer (Eqs. 7-12)
 ├── generator.py       # PreprocessingBlock, PatchEmbedding, Generator (Fig. 3-4)
 ├── discriminator.py   # PatchGAN-style Discriminator (Fig. 7)
 ├── losses.py          # AdversarialLoss, MSELoss, MaskLoss, SimilarityLoss,
@@ -88,9 +85,7 @@ These are called out in code comments; summarized here:
    64 mid-channels).
 2. **Where CNN-branch downsampling happens.** The paper gives output
    sizes 256×64×64 → 512×32×32 → 1024×16×16 for the three conv blocks but
-   not exactly which bottleneck performs the stride-2 downsampling. We
-   downsample in the first bottleneck of Conv block2 and Conv block3
-   (Conv block1 only expands channels, no spatial downsampling).
+   not exactly which bottleneck performs the stride-2 downsampling.
 3. **Transformer MLP expansion ratio.** Not stated; we use the standard
    ViT ratio of 4× (768 → 3072 → 768).
 4. **Feature Coupling Layer exact pooling/upsampling factors.** The paper
