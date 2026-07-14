@@ -31,11 +31,6 @@ class MaskLoss(nn.Module):
     only the source (G) and target (R) channels contribute
     ("only the channels G and R are taken into consideration").
     """
-
-    def __init__(self):
-        super().__init__()
-        self.register_buffer('channel_weight', torch.tensor([0.0, 1.0, 1.0]).view(1, 3, 1, 1))
-
     def forward(self, pred, target):
         mask = torch.tensor([0, 1, 1], device=pred.device).view(1, 3, 1, 1)
         weighted_pred = pred * mask
