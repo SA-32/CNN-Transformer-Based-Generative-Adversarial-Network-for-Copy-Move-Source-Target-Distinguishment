@@ -1,206 +1,348 @@
-"""
-Generator of CNN-T GAN, Sec. III-B and Figs. 3-4.
-"""
 import torch
+import math
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .layers import (
-    ConvStage,
-    TransformerStage,
-    FeatureCouplingDown,
-    FeatureCouplingUp,
-    PearsonCorrelationLayer,
-)
-
-
-class PreprocessingBlock(nn.Module):
-    """
-    Sec. III-B: "The pre-processing block first reshapes the images into
-    the size of 256x256x3, and then filters the images with a
-    convolutional layer with kernel size of 7x7 and stride of 2, followed
-    by a batch normalization (BN) layer and a rectified linear units
-    (ReLU) layer. Finally, a max pooling layer with stride 2 is used to
-    halve the size of the output feature. The size of the output feature
-    of the pre-processing block is 64x64x64."
-    """
-
-    def __init__(self, in_channels=3, out_channels=64, img_size=256):
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, d_model = 768, num_heads = 12, dropout = 0.1):
         super().__init__()
-        self.img_size = img_size
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=7,
-                               stride=2, padding=3, bias=False)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+
+        self.qkv = nn.Linear(d_model, d_model * 3)
+        self.proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        if x.shape[-2:] != (self.img_size, self.img_size):
-            x = F.interpolate(x, size=(self.img_size, self.img_size),
-                               mode='bilinear', align_corners=False)
-        x = self.relu(self.bn(self.conv(x)))
-        x = self.pool(x)
-        return x                       # (B, 64, 64, 64)
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
+        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
 
-class PatchEmbedding(nn.Module):
-    """
-    "the features output from the pre-processing block are first put into
-    a convolutional layer with kernel size of 4x4 and stride 4. Then four
-    pairs of multi-heads self-attention (MHSA) blocks and multilayer
-    perceptron (MLP) layers are followed..." (Sec. III-B.1)
-
-    64x64 features with a stride-4, 4x4 conv give a 16x16 = 256 patch
-    grid; a learnable class token is prepended, giving the 257-token
-    sequence used throughout the transformer branch.
-    """
-
-    def __init__(self, in_channels=64, d_model=768, grid_size=16):
-        super().__init__()
-        self.grid_size = grid_size
-        self.proj = nn.Conv2d(in_channels, d_model, kernel_size=4, stride=4)
-        num_patches = grid_size * grid_size
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, d_model))
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-
-    def forward(self, x):
-        x = self.proj(x)                         # (B, d_model, 16, 16)
-        B, C, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2)          # (B, 256, d_model)
-        cls = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls, x], dim=1)            # (B, 257, d_model)
-        x = x + self.pos_embed
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
         return x
 
 
-class Generator(nn.Module):
-    """
-    Generator of CNN-T GAN (Sec. III-B, Figs. 3 & 4).
 
-    The generator is composed of:
-      * a pre-processing block
-      * a CNN branch (local features) with 3 conv stages: 256x64x64,
-        512x32x32, 1024x16x16
-      * a transformer branch (global features) with 3 blocks of
-        (4, 4, 3) (MHSA, MLP) pairs operating on a fixed 257x768 token grid
-      * feature coupling layers (down: CNN->Transformer, up:
-        Transformer->CNN) attached at every stage
-      * two Pearson correlation layers (on Conv block2 and Conv block3
-        features) used to build the binary copy-move similarity mask
-
-    It produces two outputs, as described in Sec. III-A ("the generator
-    is utilized to generate a binary mask and an RGB mask"):
-      * rgb_mask    : (B, 3, H, W), tanh-activated three-class
-                      source/target/pristine map, trained with
-                      L_MSE + L_mask (Eqs. 15-16). Channel order is
-                      assumed (B, G, R) as in the paper, where only the
-                      G (source) and R (target) channels carry the
-                      re-weighted mask loss.
-      * binary_mask : (B, 1, H, W), sigmoid-activated copy-move
-                      similarity map built from the Pearson-correlation
-                      features, trained with L_simi (Eq. 17).
-    """
-
-    def __init__(self, img_size=256, d_model=768, num_heads=12, grid_size=16,
-                 pcl_top_k=32, mlp_ratio=4.0, dropout=0.1):
+# ==================== 2. Transformer ====================
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model = 768, num_heads = 12, mlp_ratio = 2.66, dropout = 0.1):
         super().__init__()
-        self.preprocess = PreprocessingBlock(3, 64, img_size)
-        self.patch_embed = PatchEmbedding(64, d_model, grid_size)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = MultiHeadSelfAttention(d_model, num_heads, dropout)
+        self.norm2 = nn.LayerNorm(d_model)
 
-        # CNN branch: 3 conv stages -> 256x64x64, 512x32x32, 1024x16x16
-        self.conv_stage1 = ConvStage(64, 256, num_bottlenecks=7, downsample=False)
-        self.conv_stage2 = ConvStage(256, 512, num_bottlenecks=8, downsample=True)
-        self.conv_stage3 = ConvStage(512, 1024, num_bottlenecks=6, downsample=True)
+        mlp_hidden_dim = int(d_model * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden_dim, d_model),
+            nn.Dropout(dropout)
+        )
 
-        # Transformer branch: 3 blocks with 4, 4, 3 (MHSA, MLP) pairs
-        self.trans_stage1 = TransformerStage(4, d_model, num_heads, mlp_ratio, dropout)
-        self.trans_stage2 = TransformerStage(4, d_model, num_heads, mlp_ratio, dropout)
-        self.trans_stage3 = TransformerStage(3, d_model, num_heads, mlp_ratio, dropout)
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
 
-        # Feature coupling layers, one down/up pair per stage (Fig. 6)
-        self.fcl_down1 = FeatureCouplingDown(256, d_model, grid_size)
-        self.fcl_up1 = FeatureCouplingUp(256, d_model, grid_size)
-        self.fcl_down2 = FeatureCouplingDown(512, d_model, grid_size)
-        self.fcl_up2 = FeatureCouplingUp(512, d_model, grid_size)
-        self.fcl_down3 = FeatureCouplingDown(1024, d_model, grid_size)
-        self.fcl_up3 = FeatureCouplingUp(1024, d_model, grid_size)
+class FeatureCouplingDown(nn.Module):
+    def __init__(self, cnn_channels, embed_dim):
+        super().__init__()
+        self.conv = nn.Conv2d(cnn_channels, embed_dim, 1)
+        self.pool = nn.AdaptiveAvgPool2d((16, 16))
+        self.norm = nn.LayerNorm(embed_dim)
+        self.act = nn.GELU()
 
-        # Pearson correlation layers on Conv block2 / Conv block3 features
-        self.pcl2 = PearsonCorrelationLayer(top_k=pcl_top_k)
-        self.pcl3 = PearsonCorrelationLayer(top_k=pcl_top_k)
+    def forward(self, x):
+        # x: [B, C, H, W] from CNN
+        x = self.conv(x)      # [B, E, H, W]
+        x = self.pool(x)      # [B, E, H/4, W/4]
+        x = x.flatten(2).transpose(1, 2)  # [B, N, E]
+        x = self.norm(x)
+        x = self.act(x)
+        return x
 
-        # Head that turns the fused multi-scale CNN features into the
-        # RGB three-class mask ("the fused feature maps are put into a
-        # tanh activation function").
+class FeatureCouplingUp(nn.Module):
+    def __init__(self, embed_dim, cnn_channels, scale_factor):
+        super().__init__()
+        self.conv = nn.Conv2d(embed_dim, cnn_channels, 1)
+        self.upsample = nn.Upsample(scale_factor = scale_factor, mode='bilinear', align_corners=False)
+        self.norm = nn.BatchNorm2d(cnn_channels)
+        self.act = nn.ReLU()
+
+    def forward(self, x):
+        # x: [B, N, E] from Transformer (excluding cls token)
+        B, N, E = x.shape
+
+        x = x.transpose(1, 2).reshape(B, E, int(N**0.5), int(N**0.5))
+        x = self.conv(x)
+        x = self.norm(x)
+        x = self.act(x)
+        x = self.upsample(x)
+        return x
+
+class Preprocessor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Conv2d(in_channels = 3, out_channels = 64, kernel_size = 7, stride = 2, padding = 3),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size = 4, stride = 2, padding = 1)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+class Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            nn.Conv2d(in_channels = 64, out_channels = 64, kernel_size = 1, padding = 0, stride = 1),
+            nn.BatchNorm2d(64, eps = 1e-06),
+            nn.ReLU(),
+            nn.Conv2d(in_channels = 64, out_channels = 64, kernel_size = 3, padding = 1, stride = 1),
+            nn.BatchNorm2d(64, eps = 1e-06),
+            nn.ReLU(),
+            nn.Conv2d(in_channels = 64, out_channels = 256, kernel_size = 1, padding = 0, stride = 1),
+            nn.BatchNorm2d(256, eps = 1e-06),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+class Block1(nn.Module):
+    def __init__(self, input_channels, output_channels):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            nn.Conv2d(in_channels = input_channels, out_channels = output_channels, kernel_size = 4, padding = 1, stride = 2),
+            nn.BatchNorm2d(output_channels, eps = 1e-06),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+class ConvBlock_1_part_1(nn.Module):
+    def __init__(self, input_channels, hidden_channels, scale_factor, m_ratio):
+        super().__init__()
+        self.cv_block_1_c1 = nn.Sequential(
+            nn.Conv2d(in_channels = input_channels, out_channels = hidden_channels, kernel_size = 1, padding = 0, stride = 1),
+            nn.BatchNorm2d(hidden_channels, eps = 1e-06),
+            nn.ReLU(),
+
+            nn.Conv2d(in_channels = hidden_channels, out_channels = hidden_channels, kernel_size = 3, padding = 1, stride = 1),
+            nn.BatchNorm2d(hidden_channels, eps = 1e-06),
+            nn.ReLU()
+        )
+
+        self.cv_block_1_c2 = nn.Sequential(
+            nn.Conv2d(in_channels = hidden_channels, out_channels = input_channels, kernel_size = 1, padding = 0, stride = 1),
+            nn.BatchNorm2d(input_channels, eps = 1e-06),
+            nn.ReLU()
+        )
+
+        self.cv_block_1_c3 = nn.Sequential(
+            nn.Conv2d(in_channels = input_channels, out_channels = hidden_channels, kernel_size = 1, stride = 1, padding = 0),
+            nn.BatchNorm2d(hidden_channels, eps = 1e-06),
+            nn.ReLU()
+        )
+
+        self.cv_block_1_c4 = nn.Sequential(
+            nn.Conv2d(in_channels = hidden_channels, out_channels = hidden_channels, kernel_size = 3, padding = 1, stride = 1),
+            nn.BatchNorm2d(hidden_channels, eps = 1e-06),
+            nn.ReLU(),
+
+            nn.Conv2d(in_channels = hidden_channels, out_channels = input_channels, kernel_size = 1, padding = 0, stride = 1),
+            nn.BatchNorm2d(input_channels, eps = 1e-06),
+            nn.ReLU()
+        )
+
+        self.transformer_block_1_part_1 = TransformerBlock(mlp_ratio = m_ratio)
+
+        self.transformer_block_1_part_2 = TransformerBlock(mlp_ratio = m_ratio)
+
+        self.fcl_down_1 = FeatureCouplingDown(hidden_channels, 768)
+
+        self.fcl_up_1 = FeatureCouplingUp(768, hidden_channels, scale_factor)
+
+
+    def forward(self, y, x):
+        z = self.transformer_block_1_part_1(x)
+        out_2 = self.cv_block_1_c1(y)
+        z = z + self.fcl_down_1(out_2)
+        z = self.transformer_block_1_part_2(z)
+        out_3 = self.cv_block_1_c2(out_2)
+        out_3 = y + out_3
+        out_4 = self.cv_block_1_c3(out_3)
+        out_4 = out_4 + self.fcl_up_1(z)
+        out_5 = self.cv_block_1_c4(out_4)
+        out_0 = out_5 + out_3
+
+        return out_0, z
+
+class ConvBlock_1(nn.Module):
+    def __init__(self, m_ratio):
+        super().__init__()
+        self.trans_1_conv = nn.Conv2d(in_channels = 64, out_channels = 768, kernel_size = 4, stride = 4)
+        self.model1 = ConvBlock_1_part_1(input_channels = 256, hidden_channels = 64, scale_factor = 4, m_ratio = m_ratio)
+        self.model2 = ConvBlock_1_part_1(input_channels = 256, hidden_channels = 64, scale_factor = 4, m_ratio = m_ratio)
+        self.model3 = ConvBlock_1_part_1(input_channels = 256, hidden_channels = 64, scale_factor = 4, m_ratio = m_ratio)
+
+
+    def forward(self, y, x):
+        x = self.trans_1_conv(x).flatten(2).permute(0,2,1)
+        y, x = self.model1(y, x)
+        y, x = self.model2(y, x)
+        y, x = self.model3(y, x)
+        return y, x
+
+class ConvBlock_2(nn.Module):
+    def __init__(self, m_ratio):
+        super().__init__()
+        self.model1 = ConvBlock_1_part_1(input_channels = 512, hidden_channels = 128, scale_factor = 2, m_ratio = m_ratio)
+        self.model2 = ConvBlock_1_part_1(input_channels = 512, hidden_channels = 128, scale_factor = 2, m_ratio = m_ratio)
+        self.model3 = ConvBlock_1_part_1(input_channels = 512, hidden_channels = 128, scale_factor = 2, m_ratio = m_ratio)
+        self.model4 = ConvBlock_1_part_1(input_channels = 512, hidden_channels = 128, scale_factor = 2, m_ratio = m_ratio)
+
+    def forward(self, y, x):
+        y, x = self.model1(y, x)
+        y, x = self.model2(y, x)
+        y, x = self.model3(y, x)
+        y, x = self.model4(y, x)
+        return y, x
+
+class ConvBlock_3(nn.Module):
+    def __init__(self, m_ratio):
+        super().__init__()
+        self.model1 = ConvBlock_1_part_1(input_channels = 1024, hidden_channels = 256, scale_factor = 1, m_ratio = m_ratio)
+        self.model2 = ConvBlock_1_part_1(input_channels = 1024, hidden_channels = 256, scale_factor = 1, m_ratio = m_ratio)
+        self.model3 = ConvBlock_1_part_1(input_channels = 1024, hidden_channels = 256, scale_factor = 1, m_ratio = m_ratio)
+
+    def forward(self, y, x):
+        y, x = self.model1(y, x)
+        y, x = self.model2(y, x)
+        y, x = self.model3(y, x)
+        return y, x
+
+class PearsonCorrelationLayer(nn.Module):
+    """
+    Computes patch-wise self-correlation of a CxHxW feature map (Eq. 7),
+    normalizes each patch vector to zero-mean/unit-std across channels
+    (Eq. 8, Assumption A6), forms the Pearson correlation score matrix
+    (Eq. 9-10), and returns the top-K correlation scores per patch,
+    reshaped back to a (K, H, W) spatial map (Eq. 11-12).
+    """
+
+    def __init__(self, topk: int = 16):
+        super().__init__()
+        self.topk = topk
+
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = feat.shape
+        N = H * W
+        f = feat.flatten(2)                       # (B, C, N)
+
+        mu = f.mean(dim=1, keepdim=True)           # per-patch mean over channels
+        sigma = f.std(dim=1, keepdim=True) + 1e-6  # per-patch std over channels
+        f_norm = (f - mu) / sigma                  # Eq. (8)
+
+        # Eq. (9)-(10): Pearson correlation between every pair of patches
+        corr = torch.bmm(f_norm.transpose(1, 2), f_norm) / C   # (B, N, N)
+
+        # Eq. (11): sort descending; Eq. (12): keep top-K (excluding self-match
+        # at k=0 which is always 1.0 and uninformative)
+        k = min(self.topk + 1, N)
+        topk_scores, _ = torch.topk(corr, k=k, dim=-1)
+        topk_scores = topk_scores[..., 1:]          # drop the trivial self-score
+
+        pooled = topk_scores.transpose(1, 2).reshape(B, self.topk, H, W)
+        return pooled
+
+class Generator(nn.Module):
+    def __init__(self, top_k = 16, mlp_ratio = 2.66):
+        super().__init__()
+
+        self.preprocess = Preprocessor()
+
+        self.conv1 = Block()
+
+        self.cv1   = ConvBlock_1(m_ratio = mlp_ratio)
+
+        self.conv2 = Block1(256, 512)
+
+        self.cv2   = ConvBlock_2(m_ratio = mlp_ratio)
+
+        self.conv3 = Block1(512, 1024)
+
+        self.cv3   = ConvBlock_3(m_ratio = mlp_ratio)
+
+        fused_channels = 256 + 512 + 1024
         self.rgb_head = nn.Sequential(
-            nn.Conv2d(256 + 512 + 1024, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(fused_channels, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, 3, kernel_size=1),
+            nn.Conv2d(128, 3, kernel_size=3, padding=1),
             nn.Tanh(),
         )
 
-        # Heads that turn the concatenated PCL outputs into the binary
-        # copy-move similarity mask ("a binary cross-entropy loss is
-        # utilized to acquire the similar regions in images").
-        self.simi_head2 = nn.Linear(pcl_top_k, 1)
-        self.simi_head3 = nn.Linear(pcl_top_k, 1)
-        self.simi_fuse = nn.Conv2d(2, 1, kernel_size=1)
+        self.pcl2 = PearsonCorrelationLayer(top_k)
+        self.pcl3 = PearsonCorrelationLayer(top_k)
+
+
+        self.mask_head = nn.Sequential(
+            nn.Conv2d(top_k * 2, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=3, padding=1),
+            nn.Sigmoid(),
+        )
 
     def forward(self, x):
-        target_size = x.shape[-2:]
+        B, _, _, _ = x.shape
 
-        feat0 = self.preprocess(x)                       # (B, 64, 64, 64)
-        tokens = self.patch_embed(feat0)                  # (B, 257, 768)
-        cnn_feat = feat0
+        x = self.preprocess(x)
 
-        # ---- stage 1 (Conv block1 <-> Trans block1) ----
-        cnn_feat = self.conv_stage1(cnn_feat)             # (B, 256, 64, 64)
-        tokens = self.trans_stage1(tokens)
-        tokens = self.fcl_down1(cnn_feat, tokens)
-        cnn_feat = cnn_feat + self.fcl_up1(tokens, cnn_feat.shape[-2:])
-        feat_c1 = cnn_feat
+        y = self.conv1(x)
 
-        # ---- stage 2 (Conv block2 <-> Trans block2) ----
-        cnn_feat = self.conv_stage2(cnn_feat)             # (B, 512, 32, 32)
-        tokens = self.trans_stage2(tokens)
-        tokens = self.fcl_down2(cnn_feat, tokens)
-        cnn_feat = cnn_feat + self.fcl_up2(tokens, cnn_feat.shape[-2:])
-        feat_c2 = cnn_feat
+        y, x = self.cv1(y, x)
 
-        # ---- stage 3 (Conv block3 <-> Trans block3) ----
-        cnn_feat = self.conv_stage3(cnn_feat)             # (B, 1024, 16, 16)
-        tokens = self.trans_stage3(tokens)
-        tokens = self.fcl_down3(cnn_feat, tokens)
-        cnn_feat = cnn_feat + self.fcl_up3(tokens, cnn_feat.shape[-2:])
-        feat_c3 = cnn_feat
+        conv1_out = y
 
-        # ---- multi-scale fusion -> RGB (three-class) mask ----
-        up1 = F.interpolate(feat_c1, size=target_size, mode='bilinear', align_corners=False)
-        up2 = F.interpolate(feat_c2, size=target_size, mode='bilinear', align_corners=False)
-        up3 = F.interpolate(feat_c3, size=target_size, mode='bilinear', align_corners=False)
+        y = self.conv2(y)
+
+        y, x = self.cv2(y, x)
+
+        conv2_out = y
+
+        y = self.conv3(y)
+
+        y, x = self.cv3(y, x)
+
+        conv3_out = y
+
+        up1 = F.interpolate(conv1_out, size = 256, mode="bilinear", align_corners=False)
+        up2 = F.interpolate(conv2_out, size = 256, mode="bilinear", align_corners=False)
+        up3 = F.interpolate(conv3_out, size = 256, mode="bilinear", align_corners=False)
         fused = torch.cat([up1, up2, up3], dim=1)
         rgb_mask = self.rgb_head(fused)
 
-        # ---- Pearson-correlation branch -> binary similarity mask ----
-        pcl_out2 = self.pcl2(feat_c2)                     # (B, N2, K)
-        pcl_out3 = self.pcl3(feat_c3)                     # (B, N3, K)
+        pcl2 = self.pcl2(conv2_out)
+        pcl3 = self.pcl3(conv3_out)
 
-        s2 = self.simi_head2(pcl_out2)                    # (B, N2, 1)
-        s3 = self.simi_head3(pcl_out3)                    # (B, N3, 1)
 
-        B = x.shape[0]
-        H2, W2 = feat_c2.shape[-2:]
-        H3, W3 = feat_c3.shape[-2:]
-        s2 = s2.transpose(1, 2).contiguous().view(B, 1, H2, W2)
-        s3 = s3.transpose(1, 2).contiguous().view(B, 1, H3, W3)
-        s2 = F.interpolate(s2, size=target_size, mode='bilinear', align_corners=False)
-        s3 = F.interpolate(s3, size=target_size, mode='bilinear', align_corners=False)
-
-        simi_logits = self.simi_fuse(torch.cat([s2, s3], dim=1))
-        binary_mask = torch.sigmoid(simi_logits)
+        pcl2_up = F.interpolate(pcl2, size = 256, mode="bilinear", align_corners=False)
+        pcl3_up = F.interpolate(pcl3, size = 256, mode="bilinear", align_corners=False)
+        pcl_fused = torch.cat([pcl2_up, pcl3_up], dim=1)
+        binary_mask = self.mask_head(pcl_fused)
 
         return {
             'rgb_mask': rgb_mask,          # (B, 3, H, W), tanh in [-1, 1]
