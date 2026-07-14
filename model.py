@@ -24,11 +24,7 @@ class CNNTGAN(nn.Module):
                  pcl_top_k=32, mlp_ratio=4.0, dropout=0.1,
                  lambda1=100.0, lambda2=50.0, lambda3=20.0):
         super().__init__()
-        self.generator = Generator(
-            img_size=img_size, d_model=d_model, num_heads=num_heads,
-            grid_size=grid_size, pcl_top_k=pcl_top_k,
-            mlp_ratio=mlp_ratio, dropout=dropout,
-        )
+        self.generator = Generator(top_k = pcl_top_k, mlp_ratio = mlp_ratio)
         self.discriminator = Discriminator(in_channels=3 + 3)
         self.criterion = CNNTGANLoss(lambda1, lambda2, lambda3)
 
